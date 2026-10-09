@@ -1,0 +1,118 @@
+# Builds Windows executables of OpenLogi from an unmerged pull request
+# (default: #1385, the M720 gesture-button fix) on GitHub's Windows machines.
+# Nothing is installed on your PC. Put this file in your own repository at
+#   .github/workflows/build-openlogi-m720-windows.yml
+# then open the repo's Actions tab and click "Run workflow".
+
+name: Build OpenLogi PR for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: OpenLogi pull request number
+        required: true
+        default: "1385"
+      pr_sha:
+        description: Commit you reviewed (optional; the build stops if the PR has changed since)
+        required: false
+        default: ""
+      arch:
+        description: Your PC's processor type (x64 for Intel/AMD, arm64 for Snapdragon)
+        type: choice
+        options: [x64, arm64]
+        default: x64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ inputs.arch }})
+    runs-on: ${{ inputs.arch == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
+    timeout-minutes: 150
+    env:
+      PR_NUMBER: ${{ inputs.pr_number }}
+      PR_SHA: ${{ inputs.pr_sha }}
+      ARCH: ${{ inputs.arch }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the pull request from AprilNEA/OpenLogi
+        uses: actions/checkout@v5
+        with:
+          repository: AprilNEA/OpenLogi
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          persist-credentials: false
+
+      - name: Confirm which commit is being built
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          Write-Host "Building AprilNEA/OpenLogi PR #$env:PR_NUMBER at commit $head"
+          git --no-pager log --oneline -n 10
+          if ($env:PR_SHA -and -not $head.StartsWith($env:PR_SHA.Trim())) {
+            throw "The PR is now at $head, not the commit you reviewed ($env:PR_SHA). Review the new commits first."
+          }
+          "HEAD_SHA=$head" >> $env:GITHUB_ENV
+
+      - name: Set up Rust (the toolchain the repository pins)
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $triple = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+            $init = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/$triple/rustup-init.exe" -OutFile $init
+            & $init -y --profile minimal --default-toolchain none
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $bin = Join-Path $env:USERPROFILE '.cargo\bin'
+            $bin >> $env:GITHUB_PATH
+            $env:Path = "$bin;$env:Path"
+          }
+          rustup toolchain install
+          if ($LASTEXITCODE) { rustup show }
+          rustc --version
+          cargo --version
+
+      - name: Build
+        run: |
+          $gui = if (Test-Path crates/openlogi-desktop) { 'openlogi-desktop' } else { 'openlogi-gui' }
+          $pkgs = @('-p', 'openlogi', '-p', $gui, '-p', 'openlogi-agent')
+          if (Test-Path crates/openlogi-overlay) { $pkgs += @('-p', 'openlogi-overlay') }
+          cargo build --release --locked @pkgs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "GUI_CRATE=$gui" >> $env:GITHUB_ENV
+
+      - name: Package like the official portable zip
+        run: |
+          $rel = 'target/release'
+          $out = "dist/OpenLogi-PR$($env:PR_NUMBER)-windows-$($env:ARCH)"
+          New-Item -ItemType Directory -Force "$out/cli" | Out-Null
+          # GUI is shipped as OpenLogi.exe and must sit next to openlogi-agent.exe.
+          Copy-Item "$rel/$($env:GUI_CRATE).exe" "$out/OpenLogi.exe"
+          Copy-Item "$rel/openlogi-agent.exe" "$out/"
+          if (Test-Path "$rel/openlogi-overlay.exe") { Copy-Item "$rel/openlogi-overlay.exe" "$out/" }
+          # Windows file names are case-insensitive: openlogi.exe would overwrite OpenLogi.exe.
+          Copy-Item "$rel/openlogi.exe" "$out/cli/openlogi.exe"
+          $info = @(
+            "OpenLogi built from AprilNEA/OpenLogi PR #$($env:PR_NUMBER)"
+            "Commit: $($env:HEAD_SHA)"
+            "Built:  $(Get-Date -Format o)"
+            "Run:    $($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
+            ""
+            "Keep OpenLogi.exe and openlogi-agent.exe in the same folder."
+            "The command-line tool is in cli\ (Windows treats openlogi.exe and OpenLogi.exe as the same name)."
+            ""
+            "SHA-256:"
+          )
+          $info += Get-ChildItem $out -Recurse -Filter *.exe | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $(Split-Path $_.Path -Leaf)" }
+          $info | Set-Content "$out/BUILD-INFO.txt"
+          Get-Content "$out/BUILD-INFO.txt"
+
+      - name: Upload the executables
+        uses: actions/upload-artifact@v6
+        with:
+          name: OpenLogi-PR${{ inputs.pr_number }}-windows-${{ inputs.arch }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
